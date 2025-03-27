@@ -150,6 +150,8 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
             **kwargs
         )
 
+        self.tokenizer = self.ov_genai_pipeline.get_tokenizer()
+
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         """
         Prepare inputs for generation.
@@ -214,11 +216,41 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
                 generation_config, **kwargs
             )
             
+            # Handle input that might exceed model's maximum context length
+            # FIXME:
+            max_prompt_len = 1024
+            logger.warning(f"Hard setting max_prompt_len == {max_prompt_len}")
+            if max_prompt_len is not None and inputs is not None:
+                # Handle different input formats
+                if isinstance(inputs, torch.Tensor):  # input_ids as tensor
+                    if inputs.shape[-1] > max_prompt_len:
+                        logger.warning(
+                            f"Input length {inputs.shape[-1]} exceeds model's maximum prompt length {max_prompt_len}. "
+                            f"Truncating input to {max_prompt_len} tokens."
+                        )
+                        inputs = inputs[..., :max_prompt_len]
+                elif isinstance(inputs, list) and all(isinstance(item, int) for item in inputs):  # input_ids as list
+                    if len(inputs) > max_prompt_len:
+                        logger.warning(
+                            f"Input length {len(inputs)} exceeds model's maximum prompt length {max_prompt_len}. "
+                            f"Truncating input to {max_prompt_len} tokens."
+                        )
+                        inputs = inputs[:max_prompt_len]
+                elif isinstance(inputs, str):  # raw text input
+                    inputs = self.tokenizer.encode(inputs, max_length=max_prompt_len)
+
             # Pass converted config to the pipeline's generate function
-            return self.ov_genai_pipeline.generate(
+            res = self.ov_genai_pipeline.generate(
                 inputs=inputs,
                 generation_config=ov_generation_config
             )
+
+            if isinstance(res, openvino_genai.EncodedResults):
+                # res.token is batched sequence, here we only process 1st batch
+                return self.tokenizer.decode(res.tokens[0])
+            
+            return res
+        
         except Exception as e:
             logger.warning(f"OpenVINO GenAI generation failed with error: {e}. Cannot fall back to standard generation.")
             raise e 
