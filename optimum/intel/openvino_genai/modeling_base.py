@@ -62,12 +62,7 @@ class OpenVINOGenAIModel:
         """
         Setup the OpenVINO GenAI environment and model.
         """
-        logger.info("Setting up base OpenVINO GenAI model")
-        # Initialize OpenVINO GenAI LLMPipeline directly from model path
-        self.ov_genai_pipeline = openvino_genai.LLMPipeline(
-            model_id=self.model_path,
-            **kwargs
-        )
+        raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
         """
@@ -91,11 +86,15 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
     OpenVINO GenAI model for causal language modeling.
     """
 
-    def __init__(self, model_path: Union[str, Path], **kwargs):
+    def __init__(self, 
+        model_path: Union[str, Path], 
+        **kwargs):
         """
         Args:
             model_path (`str` or `Path`):
                 Path to the model directory or model identifier from huggingface.co/models.
+            max_input_length (`int`, optional, defaults to 1024):
+                Maximum length of the input sequence for the model.
         """
         super().__init__(model_path, **kwargs)
         
@@ -106,15 +105,14 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
         Setup the OpenVINO GenAI environment for the model.
         """
         logger.info("Setting up OpenVINO GenAI for causal language model")
-        
         # Extract config dictionary from kwargs if any
-        config_dict = kwargs.pop("config", {})
-        
+        config_dict = kwargs.pop("config", {})        
         if not isinstance(config_dict, dict):
             config_dict = {}
         
         # Since we already have self.device set at base class, ensure it's not passed twice
         kwargs.pop("device", None)
+        self._max_prompt_len = kwargs.get("MAX_PROMPT_LEN", None)
         
         # Remove all kwargs with None values
         none_keys = [k for k, v in kwargs.items() if v is None]
@@ -143,6 +141,8 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
                 with_detokenizer=True
             )
         
+        logger.debug('optimum-intel kwargs: ',kwargs)
+
         self.ov_genai_pipeline = openvino_genai.LLMPipeline(
             models_path=self.model_path,
             device=self.device,
@@ -212,37 +212,18 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
         """
         try:
             # Convert transformers generation_config to openvino_genai generation_config
-            ov_generation_config = self._convert_transformers_config_to_openvino_genai(
-                generation_config, **kwargs
-            )
+            if self.generation_config is None:
+                self.generation_config = self._convert_transformers_config_to_openvino_genai(
+                    generation_config, **kwargs
+                )
+                self.logging_object_attributes(self.generation_config)
             
-            # Handle input that might exceed model's maximum context length
-            # FIXME:
-            max_prompt_len = 1024
-            logger.warning(f"Hard setting max_prompt_len == {max_prompt_len}")
-            if max_prompt_len is not None and inputs is not None:
-                # Handle different input formats
-                if isinstance(inputs, torch.Tensor):  # input_ids as tensor
-                    if inputs.shape[-1] > max_prompt_len:
-                        logger.warning(
-                            f"Input length {inputs.shape[-1]} exceeds model's maximum prompt length {max_prompt_len}. "
-                            f"Truncating input to {max_prompt_len} tokens."
-                        )
-                        inputs = inputs[..., :max_prompt_len]
-                elif isinstance(inputs, list) and all(isinstance(item, int) for item in inputs):  # input_ids as list
-                    if len(inputs) > max_prompt_len:
-                        logger.warning(
-                            f"Input length {len(inputs)} exceeds model's maximum prompt length {max_prompt_len}. "
-                            f"Truncating input to {max_prompt_len} tokens."
-                        )
-                        inputs = inputs[:max_prompt_len]
-                elif isinstance(inputs, str):  # raw text input
-                    inputs = self.tokenizer.encode(inputs, max_length=max_prompt_len)
+            if self.device == "NPU":
+                inputs = self.tokenizer.encode(inputs, max_length=self._max_prompt_len, pad_to_max_length=True)
 
-            # Pass converted config to the pipeline's generate function
             res = self.ov_genai_pipeline.generate(
                 inputs=inputs,
-                generation_config=ov_generation_config
+                generation_config=self.generation_config
             )
 
             if isinstance(res, openvino_genai.EncodedResults):
@@ -254,3 +235,16 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
         except Exception as e:
             logger.warning(f"OpenVINO GenAI generation failed with error: {e}. Cannot fall back to standard generation.")
             raise e 
+
+    """
+    Debugging
+    """
+    def logging_object_attributes(self, obj):
+        """Print all non-private attributes of an object."""
+        logger.debug(f"{type(obj).__name__} Attributes:")
+        
+        for attr_name in dir(obj):
+            if not attr_name.startswith('_'):
+                value = getattr(obj, attr_name)
+                if not callable(value):
+                    logger.debug(f"  {attr_name}: {value}")
