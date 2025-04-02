@@ -112,8 +112,14 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
         
         # Since we already have self.device set at base class, ensure it's not passed twice
         kwargs.pop("device", None)
-        self._max_prompt_len = kwargs.get("MAX_PROMPT_LEN", None)
-        
+        if self.device != "NPU":
+            if "MAX_PROMPT_LEN" in kwargs.keys():
+                kwargs.pop("MAX_PROMPT_LEN", None)                 
+            if "MIN_RESPONSE_LEN" in kwargs.keys():
+                kwargs.pop("MIN_RESPONSE_LEN", None)
+        else:
+            self._max_prompt_len = kwargs.get("MAX_PROMPT_LEN", None)
+
         # Remove all kwargs with None values
         none_keys = [k for k, v in kwargs.items() if v is None]
         for k in none_keys:
@@ -141,8 +147,6 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
                 with_detokenizer=True
             )
         
-        logger.debug('optimum-intel kwargs: ',kwargs)
-
         self.ov_genai_pipeline = openvino_genai.LLMPipeline(
             models_path=self.model_path,
             device=self.device,
@@ -189,7 +193,7 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
                 if hasattr(ov_config, key):
                     setattr(ov_config, key, value)
                 # If parameter doesn't exist in OpenVINO GenAI, simply drop it
-        
+        # print('_convert_transformers_config_to_openvino_genai kwargs: ', kwargs)
         # Override with any explicitly passed kwargs
         for key, value in kwargs.items():
             if hasattr(ov_config, key):
