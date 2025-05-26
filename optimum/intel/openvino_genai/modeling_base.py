@@ -180,11 +180,8 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
             generation_config=generation_config,
             **kwargs
         )
-        # if isinstance(res, openvino_genai.EncodedResults):
-        #     # res.token is batched sequence, here we only process 1st batch
-        #     print('output string:', self._ov_tokenizer.decode(res.tokens[0]))
-        # FIXME_SHJI: log_probs instead of logits
-        return res.tokens[0], res.scores[0], res.logits[0]
+
+        return res.tokens[0], res.scores[0], res.log_probs[0]
 
     def _convert_transformers_config_to_openvino_genai(self, transformers_config, **kwargs):
         """
