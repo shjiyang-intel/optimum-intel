@@ -30,6 +30,10 @@ try:
 except ImportError:
     openvino_genai_available = False
 
+from openvino_genai.py_openvino_genai import TokenizedInputs
+import openvino as ov
+from openvino import Tensor
+
 logger = logging.get_logger(__name__)
 
 
@@ -39,35 +43,28 @@ class OpenVINOGenAIModel:
     """
 
     def __init__(self, model_path: Union[str, Path], **kwargs):
-        """
-        Args:
-            model_path (`str` or `Path`):
-                Path to the model directory or model identifier from huggingface.co/models.
-        """
         if not openvino_genai_available:
             raise ImportError("OpenVINO GenAI is not available. Please install it with `pip install openvino-genai`")
             
         self.model_path = str(model_path)
-        # Load config from the model path
         self.config = AutoConfig.from_pretrained(model_path)
         
-        # Initialize device attribute at the base class level
         self.device = kwargs.get("device", "cpu")
         if isinstance(self.device, str):
-            self.device = self.device.upper()  # Keep as string but in uppercase for OpenVINO
-            
+            self.device = self.device.upper()  
+
+        self.device_is_npu = self.device == "NPU"
+
         self._setup_ov_genai(**kwargs)
 
+    @property
+    def ov_tokenizer(self):
+        return self._ov_tokenizer
+
     def _setup_ov_genai(self, **kwargs):
-        """
-        Setup the OpenVINO GenAI environment and model.
-        """
         raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
-        """
-        Call the model with the given inputs.
-        """
         return self.forward(*args, **kwargs)
 
     def forward(self, *args, **kwargs):
@@ -89,16 +86,15 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
     def __init__(self, 
         model_path: Union[str, Path], 
         **kwargs):
-        """
-        Args:
-            model_path (`str` or `Path`):
-                Path to the model directory or model identifier from huggingface.co/models.
-            max_input_length (`int`, optional, defaults to 1024):
-                Maximum length of the input sequence for the model.
-        """
         super().__init__(model_path, **kwargs)
         
-        self.generation_config = None 
+        self.generation_config = None
+
+    def __call__(self, 
+                 inputs: TokenizedInputs, 
+                 generation_config: Optional[openvino_genai.GenerationConfig] = None, 
+                 **kwargs):
+        return self.forward(inputs, generation_config, **kwargs)
 
     def _setup_ov_genai(self, **kwargs):
         """
@@ -125,6 +121,11 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
         for k in none_keys:
             kwargs.pop(k)
         
+        self.ov_genai_pipeline = openvino_genai.LLMPipeline(
+            models_path=self.model_path,
+            device=self.device,
+        )
+
         tokenizer_path = os.path.join(self.model_path, "openvino_tokenizer.xml")
         if not os.path.exists(tokenizer_path):
             logger.info("OpenVINO tokenizer not found. Converting from HF tokenizer...")
@@ -146,15 +147,8 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
                 processor.tokenizer, 
                 with_detokenizer=True
             )
-        
-        self.ov_genai_pipeline = openvino_genai.LLMPipeline(
-            models_path=self.model_path,
-            device=self.device,
-            config=config_dict,
-            **kwargs
-        )
-
-        self.tokenizer = self.ov_genai_pipeline.get_tokenizer()
+    
+        self._ov_tokenizer = self.ov_genai_pipeline.get_tokenizer()
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         """
@@ -167,23 +161,36 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
             inputs["attention_mask"] = kwargs["attention_mask"]
         return inputs
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        """
-        Forward pass is not directly supported for inference.
-        For generation, use the generate method.
-        """
-        raise NotImplementedError(
-            "Direct forward pass is not implemented for OpenVINOGenAIModelForCausalLM. "
-            "Please use the generate method for text generation."
+    def forward(self, 
+                inputs, 
+                generation_config: Optional[openvino_genai.GenerationConfig] = None, 
+                **kwargs):
+        if isinstance(inputs, TokenizedInputs) or isinstance(inputs, Tensor):
+            inputs = inputs
+        else:
+            if self.device_is_npu:
+                inputs = self._ov_tokenizer.encode(inputs, max_length=self._max_prompt_len, pad_to_max_length=True)
+            else:
+                inputs = self._ov_tokenizer.encode(inputs)
+
+        # self.logging_object_attributes(generation_config)
+
+        res = self.ov_genai_pipeline.generate(
+            inputs=inputs,
+            generation_config=generation_config,
+            **kwargs
         )
+        # if isinstance(res, openvino_genai.EncodedResults):
+        #     # res.token is batched sequence, here we only process 1st batch
+        #     print('output string:', self._ov_tokenizer.decode(res.tokens[0]))
+        # FIXME_SHJI: log_probs instead of logits
+        return res.tokens[0], res.scores[0], res.logits[0]
 
     def _convert_transformers_config_to_openvino_genai(self, transformers_config, **kwargs):
         """
         Convert a transformers GenerationConfig to an openvino_genai GenerationConfig.
         Additional kwargs override any values from the config.
-        """
-        import openvino_genai
-        
+        """        
         ov_config = openvino_genai.GenerationConfig()
         
         if transformers_config is not None:
@@ -192,9 +199,7 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
             for key, value in config_dict.items():
                 if hasattr(ov_config, key):
                     setattr(ov_config, key, value)
-                # If parameter doesn't exist in OpenVINO GenAI, simply drop it
-        # print('_convert_transformers_config_to_openvino_genai kwargs: ', kwargs)
-        # Override with any explicitly passed kwargs
+
         for key, value in kwargs.items():
             if hasattr(ov_config, key):
                 setattr(ov_config, key, value)
@@ -211,44 +216,36 @@ class OpenVINOGenAIModelForCausalLM(OpenVINOGenAIModel, GenerationMixin):
         synced_gpus=False,
         **kwargs
     ):
-        """
-        Generate sequences using OpenVINO GenAI optimizations.
-        """
-        try:
-            # Convert transformers generation_config to openvino_genai generation_config
-            if self.generation_config is None:
-                self.generation_config = self._convert_transformers_config_to_openvino_genai(
-                    generation_config, **kwargs
-                )
-                self.logging_object_attributes(self.generation_config)
-            
-            if self.device == "NPU":
-                inputs = self.tokenizer.encode(inputs, max_length=self._max_prompt_len, pad_to_max_length=True)
-
-            res = self.ov_genai_pipeline.generate(
-                inputs=inputs,
-                generation_config=self.generation_config
+        if self.generation_config is None:
+            self.generation_config = self._convert_transformers_config_to_openvino_genai(
+                generation_config, **kwargs
             )
-
-            if isinstance(res, openvino_genai.EncodedResults):
-                # res.token is batched sequence, here we only process 1st batch
-                return self.tokenizer.decode(res.tokens[0])
-            
-            return res
+            self.logging_object_attributes(self.generation_config)
         
-        except Exception as e:
-            logger.warning(f"OpenVINO GenAI generation failed with error: {e}. Cannot fall back to standard generation.")
-            raise e 
+        if self.device_is_npu:
+            inputs = self._ov_tokenizer.encode(inputs, max_length=self._max_prompt_len, pad_to_max_length=True)
 
+        res = self.ov_genai_pipeline.generate(
+            inputs=inputs,
+            generation_config=self.generation_config,
+            **kwargs
+        )
+
+        if isinstance(res, openvino_genai.EncodedResults):
+            # res.token is batched sequence, here we only process 1st batch
+            return self._ov_tokenizer.decode(res.tokens[0])
+        
+        return res
+    
     """
     Debugging
     """
     def logging_object_attributes(self, obj):
         """Print all non-private attributes of an object."""
-        logger.debug(f"{type(obj).__name__} Attributes:")
+        print(f"{type(obj).__name__} Attributes:")
         
         for attr_name in dir(obj):
             if not attr_name.startswith('_'):
                 value = getattr(obj, attr_name)
                 if not callable(value):
-                    logger.debug(f"  {attr_name}: {value}")
+                    print(f"  {attr_name}: {value}")
